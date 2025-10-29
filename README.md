@@ -1,3 +1,92 @@
+## Recursive DNS Resolver — Implementation Guide
+
+This repository contains a recursive DNS resolver implemented in `resolve.py`. It performs full recursion itself (no RD/recursive queries), starting from the root servers, following referrals, handling CNAME restarts, unglued name servers, and printing results similar to the `host` utility for A, AAAA, and MX records.
+
+The resolver includes robust error handling and both exact-result and intermediate delegation caching to minimize repeated network queries across runs in the same process.
+
+### Quick start
+
+Prerequisite: Python 3 and dnspython.
+
+Install dependency (one of):
+
+```
+pip3 install dnspython
+pip install dnspython
+python -m pip install dnspython
+```
+
+Run lookups:
+
+```
+python resolve.py yahoo.com
+python resolve.py uic.edu uic.edu   # demonstrates exact-result caching
+python resolve.py illinois.edu uic.edu -v  # demonstrates intermediate (edu.) caching and timing
+python resolve.py www.internic.net  # CNAME restart scenario
+```
+
+Output format matches `host` style, for example:
+
+```
+uic.edu. has address 128.248.155.93
+uic.edu. mail is handled by 10 uic-edu.mail.protection.outlook.com.
+```
+
+### How it works
+
+Key components in `resolve.py`:
+
+- ROOT_SERVERS: A list of IPv4 root server addresses used as the starting point.
+- CACHE: Exact-answer cache keyed by (dns.name.Name, rdatatype) to avoid identical network queries.
+- DELEGATION_CACHE: Intermediate cache that maps a zone name (e.g., `edu.`) to a list of IPv4 nameserver IPs for faster subsequent lookups within that zone.
+- RESOLVING: A guard set to prevent infinite loops during unglued nameserver resolution.
+- collect_results(name): Orchestrates fetching A, then AAAA, then MX; accumulates full CNAME chains for A lookups.
+- lookup(target, qtype): High-level loop that follows CNAME restarts and builds a final answer message, using the best known delegation (from DELEGATION_CACHE) or the root servers to start.
+- _lookup_recursive(target, qtype, nameservers): The recursive engine. It queries nameservers, handles referrals, resolves unglued NS A records when needed, caches delegations, and returns responses.
+
+### Resolution strategy
+
+1) Start at the closest known delegation for the target name. If none exist, start at the root servers.
+2) For each server in the provided list (IPv4 only), perform a UDP query with a 3-second timeout.
+3) If the response has:
+   - Final answers (answer section): cache and return.
+   - NXDOMAIN or an SOA in the authority section with no answers (NODATA): treat as a final negative, cache and return.
+   - Referral (NS in authority):
+     - If glue A records are in Additional: cache those server IPs for the delegated zone and continue recursion with them.
+     - If no glue: resolve NS hostnames to A records by recursively querying from roots; collect a few IPv4 addresses (limit 3) to continue, cache them for the zone, and recurse.
+4) If a server times out or errors, move on; do not retry the same server.
+5) Exhaustively try all servers in a referral set (once each) before giving up on that step.
+
+### Error handling (per assignment spec)
+
+- 3-second timeout for all queries.
+- Only IPv4 is used for querying nameservers (AAAA records may be printed for target results, but resolver-to-authority communication is IPv4-only).
+- Exhaustively try all available nameservers in a referral (each at most once).
+- No exceptions escape to the user; if a domain cannot be resolved, the script prints nothing or partial results without crashing.
+
+### Caching
+
+- Exact-result cache (CACHE): Responses for the exact (name, type) are reused within the same process.
+- Intermediate delegation cache (DELEGATION_CACHE): The resolver stores IPv4 nameserver IPs for zones (e.g., `edu.`). Subsequent queries under the same zone start from these servers, reducing queries (e.g., resolving `illinois.edu` then `uic.edu` queries `edu` only once).
+- Note: Caches are in-memory and do not persist across executions; TTL-based expiration is not implemented (not required by the assignment).
+
+### CNAME restarts
+
+- The resolver collects the full CNAME chain and restarts querying for the new target as needed, up to a safe limit to prevent infinite loops.
+- When referrals return no Additional (glue), it resolves NS names to A records, gathers a few IPv4 addresses quickly, and continues recursion—keeping the run under the allotted time budget.
+- Negative responses (NXDOMAIN/NODATA with SOA) are treated as final to avoid wasting time on fruitless retries.
+
+### Unglued nameservers
+
+- When the referral provides NS names without glue, the resolver recursively resolves those NS hostnames (from roots) to obtain A records, caches them for that zone, and proceeds.
+- A small guard set (RESOLVING) prevents infinite recursion when NS hostnames are within the same zone being resolved.
+
+### Verbose timing
+
+Use `-v` to see per-domain and total execution times. This is helpful to observe the effect of caching between successive lookups in one run.
+
+---
+
 ## Homework 4: Recursive DNS Resolver
 
 Your goal is to recreate the functionality of a recursive DNS resolver.
